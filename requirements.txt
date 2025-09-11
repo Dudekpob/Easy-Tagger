@@ -1,0 +1,5 @@
+PySimpleGUI
+torch
+Pillow
+transformers
+huggingface_hub
