@@ -1,4 +1,6 @@
 # Easy Tagger
+<img width="794" height="734" alt="image" src="https://github.com/user-attachments/assets/3305aa73-dc32-4caa-a54d-b7e551e8d618" />
+
 
 A simple GUI application for image tagging using the WD-14 model. This tool makes it easy to automatically generate tags for your images with additional customization options.
 
