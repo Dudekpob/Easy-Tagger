@@ -1,0 +1,36 @@
+{
+    "caption_type_map": {
+        "Descriptive": [
+            "Describe this image in detail",
+            "Describe this image in {length} words",
+            "Describe this image in exactly {word_count} words"
+        ],
+        "Simple": [
+            "Describe this image briefly",
+            "Describe this image in {length} words or less",
+            "Describe this image in exactly {word_count} words"
+        ],
+        "Tags": [
+            "List the key tags and elements in this image",
+            "List {length} key tags and elements in this image",
+            "List exactly {word_count} key tags in this image"
+        ]
+    },
+    "model_settings": {
+        "context_window": 4096,
+        "cpu_threads": 8,
+        "default_system_prompt": "You are an AI trained to analyze and describe images accurately and concisely. Focus on the most important and distinctive elements in the image. Return tags separated by commas, with multi-word concepts kept as phrases without underscores.",
+        "default_max_tokens": 512,
+        "default_temperature": 0.7,
+        "default_top_p": 0.9,
+        "default_top_k": 50,
+        "use_underscores": false,
+        "tag_separator": ", "
+    },
+    "caption_length_choices": ["any", "10", "20", "30", "50", "100"],
+    "gguf_models": {
+        "JoyCaption v1": {
+            "name": "concedo/llama-joycaption-beta-one-hf-llava-gguf/llama-joycaption-beta-one-llava-model-q5_k_m.gguf"
+        }
+    }
+}

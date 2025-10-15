@@ -1,5 +1,9 @@
-PySimpleGUI
 torch
 Pillow
 transformers
 huggingface_hub
+onnxruntime
+pandas
+llama-cpp-python
+torchvision
+numpy
