@@ -5,10 +5,12 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import torch
 import torch.amp.autocast_mode
+import torch.nn.functional as F
+import torch.nn as nn
 from PIL import Image
 import numpy as np
 import onnxruntime as ort
-from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoProcessor, AutoModelForVision2Seq, pipeline, AutoModelForImageClassification
 from huggingface_hub import snapshot_download, hf_hub_download
 import shutil
 import pandas as pd
@@ -18,11 +20,7 @@ from llama_cpp.llama_chat_format import Llava15ChatHandler
 import base64
 import io
 import gc
-from safetensors.torch import load_file
 from pathlib import Path
-import torchvision
-from torchvision.transforms import ToPILImage
-from Models.VisionModel import VisionModel
 
 # Load JoyCaption configuration
 with open(Path(__file__).parent / "jc_data.json", "r", encoding="utf-8") as f:
@@ -38,10 +36,11 @@ MODEL_CONFIGS = {
         "type": "caption",
         "model_file": "llama-joycaption-beta-one-hf-llava.Q4_K_M.gguf"
     },
-    "JoyTag": {
-        "name": "fancyfeast/joytag",
-        "type": "joytag",
-        "custom_model": True
+    "Florence-2": {
+        "name": "microsoft/florence-2-base",
+        "type": "florence",
+        "processor": "microsoft/florence-2-base",
+        "modes": ["tags", "caption"]
     }
 }
 
@@ -129,113 +128,157 @@ class JoyCaptionProcessor:
         finally:
             gc.collect()
 
-class JoyTagProcessor:
-    def __init__(self, model_path):
+class FlorenceProcessor:
+    def __init__(self, mode="tags"):
         try:
-            self.model_path = Path(model_path).resolve()
-            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            self.device = "cuda" if torch.cuda.is_available() else "cpu"
+            config = MODEL_CONFIGS["Florence-2"]
+            self.mode = mode
             
-            # Initialize model
-            print(f"Loading JoyTag model from: {self.model_path}")
-            self.model = VisionModel.load_model(self.model_path)
-            print("Model loaded successfully")
-            self.model.eval()
-            print(f"Moving model to device: {self.device}")
-            self.model = self.model.to(self.device)
-            
-            # Load tags list
-            tags_path = self.model_path / 'top_tags.txt'
-            print(f"Loading tags from: {tags_path}")
-            with open(tags_path, 'r', encoding='utf-8') as f:
-                self.top_tags = [line.strip() for line in f.readlines() if line.strip()]
-            print(f"Loaded {len(self.top_tags)} tags")
-            
-            self.threshold = 0.4
+            # Initialize processor and model based on mode
+            print(f"Loading Florence-2 model in {mode} mode...")
+            if mode == "tags":
+                self.model = pipeline(
+                    "image-classification",
+                    model=config["name"],
+                    device=0 if self.device == "cuda" else -1
+                )
+            else:  # caption mode
+                self.model = pipeline(
+                    "image-to-text",
+                    model=config["name"],
+                    device=0 if self.device == "cuda" else -1
+                )
+            print("Florence-2 model loaded successfully")
             
         except Exception as e:
             import traceback
             traceback.print_exc()
-            raise RuntimeError(f"JoyTag initialization failed: {str(e)}")
+            raise RuntimeError(f"Florence initialization failed: {str(e)}")
 
-    def prepare_image(self, image: Image.Image) -> torch.Tensor:
-        if image.mode != 'RGB':
-            image = image.convert('RGB')
-            
-        # Pad image to square
-        w, h = image.size
-        max_dim = max(w, h)
-        pad_left = (max_dim - w) // 2
-        pad_top = (max_dim - h) // 2
-
-        padded_image = Image.new('RGB', (max_dim, max_dim), (255, 255, 255))
-        padded_image.paste(image, (pad_left, pad_top))
-
-        # Resize image
-        target_size = self.model.image_size
-        if max_dim != target_size:
-            padded_image = padded_image.resize((target_size, target_size), Image.BICUBIC)
-        
-        # Convert to numpy array and then to tensor
-        image_np = np.array(padded_image)
-        image_tensor = torch.from_numpy(image_np).float().permute(2, 0, 1) / 255.0
-
-        # Normalize using CLIP mean and std
-        mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(-1, 1, 1)
-        std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(-1, 1, 1)
-        image_tensor = (image_tensor - mean) / std
-
-        return image_tensor
-
-    @torch.no_grad()
     def __call__(self, image, additional_tags=None):
         try:
+            print(f"\n=== Florence-2 Processing Start ({self.mode} mode) ===")
+            
             # Convert and prepare image
             if not isinstance(image, Image.Image):
+                print(f"Opening image from path: {image}")
                 image = Image.open(image).convert('RGB')
             
-            # Prepare image tensor
-            image_tensor = self.prepare_image(image)
-            batch = {'image': image_tensor.unsqueeze(0).to(self.device)}
-
-            # Get predictions with autocast for better performance
-            with torch.amp.autocast_mode.autocast(self.device, enabled=True):
-                preds = self.model(batch)
-                tag_preds = preds['tags'].sigmoid().cpu()
+            print(f"Processing image of size: {image.size}")
             
-            # Calculate scores for each tag
-            scores = {self.top_tags[i]: tag_preds[0][i].item() 
-                     for i in range(len(self.top_tags))}
-            
-            # Get tags above threshold
-            predicted_tags = [tag for tag, score in scores.items() 
-                            if score > self.threshold]
+            # Process based on mode
+            if self.mode == "tags":
+                predictions = self.model(image)
+                threshold = 0.35
+                result = [pred['label'] for pred in predictions if pred['score'] > threshold]
+            else:  # caption mode
+                prediction = self.model(image)
+                result = [prediction[0]['generated_text']]
             
             # Add additional tags if provided
             if additional_tags:
-                extra_tags = [tag.strip() for tag in additional_tags.split(",") 
-                            if tag.strip()]
+                result.extend(additional_tags.split(","))
+            
+            print(f"Generated {len(result)} {'tags' if self.mode == 'tags' else 'caption'}")
+            print("=== Florence-2 Processing Complete ===\n")
+            
+            return ", ".join(result)
+            
+        except Exception as e:
+            print(f"Error in Florence-2 processing: {str(e)}")
+            return f"Error: {str(e)}"
+        finally:
+            if self.device == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+            
+            batch = {'image': image_tensor.unsqueeze(0).to(self.device)}
+            
+            # Run inference with mixed precision
+            print("\nRunning model inference...")
+            with torch.amp.autocast_mode.autocast(self.device, enabled=True):
+                preds = self.model(batch)
+                print(f"\nRaw predictions:")
+                print(f"- Type: {type(preds)}")
+                print(f"- Shape: {preds.shape if isinstance(preds, torch.Tensor) else [type(p) for p in preds] if isinstance(preds, tuple) else preds.keys() if isinstance(preds, dict) else 'unknown'}")
+                
+                if isinstance(preds, dict):
+                    print("Processing dictionary predictions...")
+                    preds = preds['tags'] if 'tags' in preds else preds
+                if isinstance(preds, tuple):
+                    print("Processing tuple predictions...")
+                    preds = preds[0]
+                
+                print(f"\nPre-sigmoid stats:")
+                print(f"- Shape: {preds.shape}")
+                print(f"- Range: [{preds.min().item():.3f}, {preds.max().item():.3f}]")
+                
+                # Apply sigmoid
+                tag_preds = torch.sigmoid(preds).cpu()
+                
+                print(f"\nPost-sigmoid stats:")
+                print(f"- Shape: {tag_preds.shape}")
+                print(f"- Range: [{tag_preds.min().item():.3f}, {tag_preds.max().item():.3f}]")
+            
+            # Calculate scores for each tag
+            print("\nProcessing tag scores...")
+            n_tags = len(self.top_tags)
+            scores = {}
+            for i in range(min(n_tags, tag_preds.shape[1])):
+                tag = self.top_tags[i]
+                confidence = float(tag_preds[0][i])
+                scores[tag] = confidence
+            
+            print(f"Processed {len(scores)} tag scores")
+            
+            # Sort tags by confidence
+            sorted_tags = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            
+            print(f"\nConfidence thresholds:")
+            print(f"- High confidence: > 0.85")
+            print(f"- Medium confidence: > {self.threshold}")
+            
+            # Get top tags with different confidence thresholds
+            predicted_tags = []
+            print("\nSelecting tags above thresholds:")
+            for tag, confidence in sorted_tags:
+                if len(predicted_tags) >= 30:
+                    break
+                if confidence > 0.5:  # High confidence tags (lowered from 0.85)
+                    print(f"High confidence: {tag} ({confidence*100:.1f}%)")
+                    predicted_tags.append(f"{tag} ({confidence*100:.1f}%)")
+                elif confidence > self.threshold:  # Medium confidence tags
+                    print(f"Medium confidence: {tag} ({confidence*100:.1f}%)")
+                    predicted_tags.append(tag)
+                elif len(predicted_tags) < 5:  # Ensure we get at least some tags
+                    print(f"Low confidence: {tag} ({confidence*100:.1f}%)")
+                    predicted_tags.append(tag)
+            
+            print(f"\nSelected {len(predicted_tags)} tags")
+            
+            # Add additional tags if provided
+            if additional_tags:
+                print(f"\nAdding {len(additional_tags.split(','))} additional tags")
+                extra_tags = [tag.strip() for tag in additional_tags.split(",") if tag.strip()]
                 predicted_tags.extend(extra_tags)
             
             # Create final tag string
             tag_string = ', '.join(predicted_tags)
             
-            # Sort and print top scores for debugging
-            print("\nTop 10 predictions:")
-            for tag, score in sorted(scores.items(), 
-                                   key=lambda x: x[1], 
-                                   reverse=True)[:10]:
+            # Print top predictions for debugging
+            print("\nTop 10 predictions with scores:")
+            for tag, score in sorted_tags[:10]:
                 print(f"{tag}: {score:.3f}")
             
+            if not predicted_tags:
+                print("\nWARNING: No tags predicted! This might indicate an issue with the model or thresholds.")
+            else:
+                print(f"\nFinal tags: {tag_string}")
+            
+            print("=== JoyTag Processing Complete ===\n")
             return tag_string
             
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            return f"Error: {str(e)}"
-        finally:
-            torch.cuda.empty_cache() if torch.cuda.is_available() else None
-
-
 class WD14Processor:
     def __init__(self, model_path):
         model_path = os.path.abspath(model_path)
@@ -366,14 +409,14 @@ Notes:
         model_combo.bind('<<ComboboxSelected>>', self.on_model_select)
         current_row += 1
         
-        # Custom Model Input (for JoyTag)
-        self.custom_model_frame = ttk.Frame(main_frame)
-        self.custom_model_frame.grid(row=current_row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        ttk.Label(self.custom_model_frame, text="Custom Model:").grid(row=0, column=0, sticky=tk.W)
-        self.custom_model_entry = ttk.Entry(self.custom_model_frame)
-        self.custom_model_entry.grid(row=0, column=1, sticky=(tk.W, tk.E))
-        ttk.Label(self.custom_model_frame, text="(e.g. username/model-name)").grid(row=0, column=2, sticky=tk.W, padx=5)
-        self.custom_model_frame.grid_remove()  # Hide by default
+        # Mode Selection for Florence-2
+        self.mode_frame = ttk.Frame(main_frame)
+        self.mode_frame.grid(row=current_row, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        ttk.Label(self.mode_frame, text="Mode:").grid(row=0, column=0, sticky=tk.W)
+        self.mode_var = tk.StringVar(value="tags")
+        mode_combo = ttk.Combobox(self.mode_frame, textvariable=self.mode_var, values=["tags", "caption"], state="readonly", width=15)
+        mode_combo.grid(row=0, column=1, sticky=tk.W, padx=5)
+        self.mode_frame.grid_remove()  # Hide by default
         current_row += 1
         
         # Input Type Selection
@@ -460,10 +503,12 @@ Notes:
         
     def on_model_select(self, event=None):
         model_choice = self.model_var.get()
-        if model_choice == "JoyTag":
-            self.custom_model_frame.grid()
+        
+        # Show/hide Florence-2 mode selection
+        if model_choice == "Florence-2":
+            self.mode_frame.grid()
         else:
-            self.custom_model_frame.grid_remove()
+            self.mode_frame.grid_remove()
     
     def update_input_mode(self):
         self.input_entry.delete(0, tk.END)
@@ -616,8 +661,8 @@ Notes:
                 processor = WD14Processor(model_path)
             elif model_config['type'] == "caption":
                 processor = JoyCaptionProcessor()
-            elif model_config['type'] == "joytag":
-                processor = JoyTagProcessor(model_path)
+            elif model_config['type'] == "florence":
+                processor = FlorenceProcessor(mode=self.mode_var.get())
             
             # Collect all image files
             image_files = []
@@ -647,11 +692,6 @@ Notes:
                         
                         inputs = processor(images=image, return_tensors="pt")
                         input_array = inputs["input"]
-                        
-                        # Debug prints
-                        print(f"Input array shape before inference: {input_array.shape}")
-                        print(f"Input array dtype: {input_array.dtype}")
-                        
                         outputs = processor.session.run(None, {input_name: input_array})
                         
                         # Get settings from UI
@@ -677,11 +717,25 @@ Notes:
                             high_threshold=high_thresh
                         )
                         
-                        # Debug print
-                        print(f"Output shape: {outputs[0].shape}")
+                    elif model_config['type'] == "joytag":
+                        # Get settings from UI
+                        additional_tags = self.additional_tags_entry.get().strip()
+                        banned_tags = self.banned_tags_entry.get().strip()
+                        try:
+                            low_thresh = float(self.low_threshold.get())
+                            high_thresh = float(self.high_threshold.get())
+                        except ValueError:
+                            low_thresh = 0.35
+                            high_thresh = 0.85
                         
-                        self.update_status(f"Generated tags: {tags}")
-                    else:
+                        # Update processor thresholds
+                        processor.threshold = low_thresh
+                        
+                        # Process image with JoyTag model
+                        tags = processor(image, additional_tags)
+                        self.update_status(f"JoyTag generated tags: {tags}")
+                        
+                    elif model_config['type'] == "caption":
                         # For JoyCaption, pass the image and get additional tags
                         additional_tags = self.additional_tags_entry.get().strip()
                         tags = processor(image)
@@ -693,13 +747,15 @@ Notes:
                             all_tags = model_tags + extra_tags
                             tags = ", ".join(all_tags)
                     
+                    self.update_status(f"Generated tags: {tags}")
+                    
                     # Save image and tags
                     base_name = os.path.splitext(os.path.basename(image_path))[0]
                     ext = os.path.splitext(image_path)[1]
                     
                     # Generate output paths
                     new_image_path = os.path.join(output_path, f"{base_name}{ext}")
-                    tags_file_path = os.path.join(output_path, f"{base_name}_tags.txt")
+                    tags_file_path = os.path.join(output_path, f"{base_name}.txt")
                     
                     try:
                         # Only copy if source and destination are different
