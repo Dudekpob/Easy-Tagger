@@ -2,6 +2,16 @@
 <img width="794" height="734" alt="image" src="https://github.com/user-attachments/assets/3305aa73-dc32-4caa-a54d-b7e551e8d618" />
 
 
+git clone https://github.com/Dudekpob/easy-tagger.git
+
+if you get error ModuleNotFoundError: No module named 'tkinter'
+
+sudo apt install python3-tk
+
+start application with
+
+python3 image_tagger.py
+
 A simple GUI application for image tagging using the WD-14 model. This tool makes it easy to automatically generate tags for your images with additional customization options.
 
 ## Features
